@@ -34,6 +34,10 @@ private:
     std::vector<std::string> output_names_stg;
     std::vector<const char*> output_names_ptr;
     std::map<int, std::tuple<int, int, int>> stride_map;
+    
+    // EMA Smoothing variable
+    float smoothed_age = -1.0f;
+    float smoothed_gender_diff = 0.0f;
 
     // --- The Core AI Functions ---
     std::vector<FaceObject> detectSCRFD(const cv::Mat& frame);

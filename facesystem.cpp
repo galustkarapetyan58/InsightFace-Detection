@@ -215,16 +215,34 @@ vector<FaceObject> FaceSystem::detectSCRFD(const Mat& frame) {
             temp_faces.push_back(obj);
         }
         
-        // --- KEY FIX: Keep ONLY the largest face ---
-        // This eliminates all small background detections
+        // --- KEY FIX: Keep ONLY the BEST face (Highest Confidence) ---
+        // The real face usually has the highest score, while background noise is lower
         if(!temp_faces.empty()) {
-            // Sort by area (descending)
+            // Sort by Confidence (descending)
             std::sort(temp_faces.begin(), temp_faces.end(), [](const FaceObject& a, const FaceObject& b) {
-                return (a.box.area()) > (b.box.area());
+                return a.confidence > b.confidence;
             });
             
-            // Keep ONLY the biggest face (the user)
-            faces.push_back(temp_faces[0]);
+            // Keep ONLY the most confident detection
+            FaceObject& best_face = temp_faces[0];
+            
+            // --- Expand Box (Padding) ---
+            // User requested bigger box: Add 20% padding
+            float pad_x = best_face.box.width * 0.2f;
+            float pad_y = best_face.box.height * 0.2f;
+            
+            best_face.box.x -= pad_x;
+            best_face.box.y -= pad_y;
+            best_face.box.width += (pad_x * 2);
+            best_face.box.height += (pad_y * 2);
+            
+            // Clamp to frame boundaries
+            // Note: We don't have frame size here easily, but cv::Rect handles intersections well usually,
+            // or we can just rely on the drawing loop to handle clipping, but for safety:
+            // Since we passed 'frame' to this function, we can check boundaries:
+            best_face.box &= Rect(0, 0, frame.cols, frame.rows); // Intersection limits it
+            
+            faces.push_back(best_face);
         }
 
     } catch (const Ort::Exception& e) {
@@ -278,40 +296,39 @@ void FaceSystem::analyzeFace(const Mat& frame, FaceObject& face) {
             float* ga_data = outGA_vals[0].GetTensorMutableData<float>();
             
             // Gender: [0]=Male, [1]=Female
-            face.gender = (ga_data[0] > ga_data[1]) ? "M" : "F";
+            // Smooth the difference: (Male - Female)
+            float raw_diff = ga_data[0] - ga_data[1];
+            
+            // Initialize or Smooth
+            if(smoothed_age < 0) smoothed_gender_diff = raw_diff; // Init
+            else smoothed_gender_diff = (smoothed_gender_diff * 0.8f) + (raw_diff * 0.2f);
+            
+            face.gender = (smoothed_gender_diff > 0) ? "M" : "F";
             
             // Age: Model outputs 0-1 range, multiply by 100
             float raw_age = ga_data[2];
-            face.age = (int)(raw_age * 100);
+            float current_age = raw_age * 100.0f;
+            
+            // --- EMA Smoothing (Butter Smooth) ---
+            if(smoothed_age < 0) {
+                smoothed_age = current_age; // Initialize
+            } else {
+                // Alpha 0.15 = Smooth
+                float alpha = 0.15f; 
+                smoothed_age = (smoothed_age * (1.0f - alpha)) + (current_age * alpha);
+            }
+            
+            face.age = (int)smoothed_age;
+            
          } catch(std::exception& e) {
              cerr << "GA Error: " << e.what() << endl;
          }
     }
 
     // C. Skip Recognition (not needed for display, slows down FPS)
-    // Uncomment if you need embeddings:
     /*
     if(rec_session) {
-        try {
-            Mat blobRec = dnn::blobFromImage(aligned, 1.0/127.5, Size(112, 112), Scalar(127.5, 127.5, 127.5), true);
-            auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-            int64_t shapeRec[] = {1, 3, 112, 112};
-            Ort::Value tensorRec = Ort::Value::CreateTensor<float>(memory, (float*)blobRec.data, blobRec.total(), shapeRec, 4);
-
-            Ort::AllocatorWithDefaultOptions allocator;
-            auto name_in_ptr = rec_session->GetInputNameAllocated(0, allocator);
-            auto name_out_ptr = rec_session->GetOutputNameAllocated(0, allocator);
-            const char* in_name = name_in_ptr.get();
-            const char* out_name = name_out_ptr.get();
-
-            auto outRec_vals = rec_session->Run(Ort::RunOptions{nullptr}, &in_name, &tensorRec, 1, &out_name, 1);
-            float* emb_data = outRec_vals[0].GetTensorMutableData<float>();
-            face.embedding.assign(emb_data, emb_data + 512);
-        
-        } catch(std::exception& e) {
-            cerr << "Rec Error: " << e.what() << endl;
-            face.embedding = {0};
-        }
+        // ... code ...
     }
     */
 }
@@ -340,6 +357,12 @@ void FaceSystem::runWebcam() {
 
         // 1. Detect
         vector<FaceObject> faces = detectSCRFD(frame);
+        
+        // Reset smoothing if lost face
+        if(faces.empty()) {
+            smoothed_age = -1.0f;
+            smoothed_gender_diff = 0.0f;
+        }
 
         // 2. Analyze & Draw
         for(auto& face : faces) {
@@ -350,14 +373,34 @@ void FaceSystem::runWebcam() {
                 continue;  // Skip this face
             }
 
-            // 3. Draw
-            rectangle(frame, face.box, Scalar(0, 255, 0), 2);
-            for(auto& p : face.landmarks) circle(frame, p, 2, Scalar(0,0,255), -1);
+            // --- Professional UI Drawing ---
             
-            // Clean professional label format
-            string gender_full = (face.gender == "M") ? "Male" : "Female";
-            string label = gender_full + ", Age: " + to_string(face.age);
-            putText(frame, label, Point(face.box.x, face.box.y - 10), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0,255,0), 2);
+            // Color scheme: Blue for Male, Pink/Red for Female
+            Scalar color = (face.gender == "M") ? Scalar(255, 100, 0) : Scalar(147, 20, 255); // BGR
+            
+            // 1. Draw Box
+            rectangle(frame, face.box, color, 2);
+            
+            // 2. Draw Landmarks (Subtle White)
+            for(auto& p : face.landmarks) circle(frame, p, 2, Scalar(255, 255, 255), -1);
+            
+            // 3. Draw Label with Background
+            string gender_text = (face.gender == "M") ? "Male" : "Female";
+            string label = gender_text + ", Age: " + to_string(face.age);
+            
+            int baseLine;
+            Size labelSize = getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.6, 2, &baseLine);
+            
+            // Label Background Rect (Above box)
+            Rect labelRect(face.box.x, face.box.y - labelSize.height - 10, labelSize.width + 10, labelSize.height + 10);
+            
+            // Ensure label stays inside frame
+            if (labelRect.y < 0) labelRect.y = face.box.y + face.box.height; // Move to bottom if clipped
+            
+            rectangle(frame, labelRect, color, FILLED);
+            
+            // White Text
+            putText(frame, label, Point(labelRect.x + 5, labelRect.y + labelSize.height + 2), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
         }
 
         imshow("InsightFace Professional", frame);
