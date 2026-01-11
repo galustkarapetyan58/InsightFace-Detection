@@ -6,6 +6,12 @@
 #include <deque>
 #include <numeric>
 
+// --- HIGH PERFORMANCE SETTINGS ---
+static int frame_counter = 0;
+static std::vector<FaceResult> cached_faces; // Stores the result to reuse
+const int DETECT_INTERVAL = 3;  // Run detection every 3 frames (boosts FPS)
+const int AGE_INTERVAL = 30;    // Run age check every 30 frames (huge FPS boost)
+
 // --- STABILIZER ---
 static std::deque<int> age_history;
 static std::deque<int> gender_history;
@@ -61,8 +67,8 @@ FaceSystem::~FaceSystem() {
 bool FaceSystem::loadModels(const std::string& detPath, const std::string& agePath) {
     try {
         Ort::SessionOptions opts;
-        opts.SetIntraOpNumThreads(1);
-        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+        opts.SetIntraOpNumThreads(2); // Use 2 threads for speed
+        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL); // Max speed
 
         sessDet = new Ort::Session(env, std::wstring(detPath.begin(), detPath.end()).c_str(), opts);
         sessAge = new Ort::Session(env, std::wstring(agePath.begin(), agePath.end()).c_str(), opts);
@@ -154,6 +160,13 @@ std::vector<FaceResult> run_inference_pass(Ort::Session* sess, const cv::Mat& im
 std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
     if (img.empty()) return {};
 
+    frame_counter++;
+
+    // 1. SKIP DETECTION if not needed (Reuse last known faces)
+    if (frame_counter % DETECT_INTERVAL != 0 && !cached_faces.empty()) {
+        return { cached_faces[0] }; // Return cached result immediately
+    }
+
     try {
         Ort::AllocatorWithDefaultOptions allocator;
         auto inputNamePtr = sessDet->GetInputNameAllocated(0, allocator);
@@ -171,20 +184,37 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
         outputNames.reserve(numOutputs);
         for(const auto& s : outputNameStrings) outputNames.push_back(s.c_str());
 
+        // Run Detection
         float max_score = 0.0f;
         std::vector<FaceResult> faces = run_inference_pass(sessDet, img, 1.0/128.0, cv::Scalar(127.5, 127.5, 127.5), true, {inputNames[0]}, outputNames, max_score);
 
         std::vector<FaceResult> nms_faces;
         nms(faces, nms_faces, 0.4f);
 
-        if (nms_faces.empty()) return {};
+        if (nms_faces.empty()) {
+            cached_faces.clear();
+            return {};
+        }
 
         std::sort(nms_faces.begin(), nms_faces.end(), [](const FaceResult& a, const FaceResult& b) {
             return (a.box.width * a.box.height) > (b.box.width * b.box.height);
         });
 
         FaceResult& mainFace = nms_faces[0];
-        runAgeGender(img, nms_faces);
+
+        // 2. SKIP AGE CHECK (Reuse old age if not time yet)
+        bool time_to_update_age = (frame_counter % AGE_INTERVAL == 0);
+
+        if (time_to_update_age || cached_faces.empty()) {
+            runAgeGender(img, nms_faces);
+        } else {
+            // Copy old Age/Gender to new detection box
+            mainFace.age = cached_faces[0].age;
+            mainFace.gender = cached_faces[0].gender;
+        }
+
+        // Save result for the next frames
+        cached_faces = { mainFace };
         return { mainFace };
 
     } catch (...) { return {}; }
@@ -215,20 +245,8 @@ void FaceSystem::runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces
 
         FaceResult& face = faces[0];
         cv::Mat aligned = alignFace(img, face.kps);
+        if (aligned.empty()) return;
 
-        // Keep visual debug for confirmation
-        if (!aligned.empty()) {
-            cv::Mat debugROI = img(cv::Rect(0, 0, 96, 96));
-            cv::Mat resized;
-            cv::resize(aligned, resized, cv::Size(96,96));
-            resized.copyTo(debugROI);
-            cv::putText(const_cast<cv::Mat&>(img), "AI Input", cv::Point(5, 15),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1);
-        }
-
-        // --- CRITICAL FIX: SCALE 1.0 (NO NORM) ---
-        // Some Age models hate the 1/128 scaling. We try Scale 1.0 (Raw Pixels).
-        // If this doesn't work, the next step is 1.0/255.0.
         cv::Mat blob;
         cv::dnn::blobFromImage(aligned, blob, 1.0, cv::Size(96, 96), cv::Scalar(0, 0, 0), true, false);
 
@@ -239,12 +257,10 @@ void FaceSystem::runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces
         auto outputTensors = sessAge->Run(Ort::RunOptions{nullptr}, inputNames, &inputOrt, 1, outputNames, 1);
         float* outputData = outputTensors[0].GetTensorMutableData<float>();
 
-        // Log to console so we can see the change
-        std::cout << "Raw Age Data (NoScale): " << outputData[2] * 100 << std::endl;
-
         int cur_gender = (outputData[1] > outputData[0]) ? 1 : 0;
         int cur_age = static_cast<int>(outputData[2] * 100);
 
+        // Stabilizer
         age_history.push_back(cur_age);
         gender_history.push_back(cur_gender);
         if (age_history.size() > HISTORY_SIZE) age_history.pop_front();
@@ -260,5 +276,4 @@ void FaceSystem::runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces
     }
 }
 
-// Stub for linker
 std::vector<FaceResult> FaceSystem::runSCRFD(const cv::Mat&) { return {}; }
