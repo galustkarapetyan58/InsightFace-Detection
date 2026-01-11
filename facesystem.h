@@ -1,50 +1,38 @@
-#ifndef FACESYSTEM_H
-#define FACESYSTEM_H
+#pragma once
 
-#include <onnxruntime_cxx_api.h>
 #include <opencv2/opencv.hpp>
+#include <onnxruntime_cxx_api.h>
 #include <vector>
 #include <string>
 
-// A structure to hold one face's data
-struct FaceObject {
-    cv::Rect box;
-    std::vector<cv::Point2f> landmarks; // 5 points (Eyes, Nose, Mouth)
-    float confidence;
-    int age;
-    std::string gender;
-    std::vector<float> embedding; // The "Identity" vector
+// Holds the final result for one face
+struct FaceResult {
+    cv::Rect box;                 // Bounding box
+    float score;                  // Detection confidence
+    std::vector<cv::Point2f> kps; // 5 landmarks
+
+    int age = -1;                 // Estimated Age
+    int gender = -1;              // 0 = Female, 1 = Male
 };
 
 class FaceSystem {
 public:
     FaceSystem();
-    bool loadModels(const std::string& detPath, const std::string& recPath, const std::string& gaPath);
-    void runWebcam();
+    ~FaceSystem();
+
+    // Load models
+    bool loadModels(const std::string& detPath, const std::string& agePath);
+
+    // Main function: Detect -> Align -> Estimate Age
+    std::vector<FaceResult> detectAndEstimate(const cv::Mat& img);
 
 private:
     Ort::Env env;
-    std::unique_ptr<Ort::Session> det_session;
-    std::unique_ptr<Ort::Session> rec_session;
-    std::unique_ptr<Ort::Session> ga_session;
+    Ort::Session* sessDet = nullptr;
+    Ort::Session* sessAge = nullptr;
 
-    // --- Cache for SCRFD (Fix FPS) ---
-    std::vector<std::string> input_names_stg;
-    std::vector<const char*> input_names_ptr;
-    std::vector<std::string> output_names_stg;
-    std::vector<const char*> output_names_ptr;
-    std::map<int, std::tuple<int, int, int>> stride_map;
-    
-    // EMA Smoothing variable
-    float smoothed_age = -1.0f;
-    float smoothed_gender_diff = 0.0f;
-
-    // --- The Core AI Functions ---
-    std::vector<FaceObject> detectSCRFD(const cv::Mat& frame);
-    void analyzeFace(const cv::Mat& frame, FaceObject& face); // Gets Age + Recognition
-
-    // Helper to align the face before recognition
-    cv::Mat alignFace(const cv::Mat& frame, const std::vector<cv::Point2f>& kps);
+    // Internal Helpers
+    std::vector<FaceResult> runSCRFD(const cv::Mat& img);
+    void runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces);
+    cv::Mat alignFace(const cv::Mat& img, const std::vector<cv::Point2f>& kps);
 };
-
-#endif

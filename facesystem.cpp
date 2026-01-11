@@ -1,410 +1,264 @@
 #include "facesystem.h"
 #include <iostream>
-#include <chrono>
-#include <thread>
+#include <algorithm>
+#include <vector>
 #include <cmath>
+#include <deque>
+#include <numeric>
 
-using namespace cv;
-using namespace std;
+// --- STABILIZER ---
+static std::deque<int> age_history;
+static std::deque<int> gender_history;
+const int HISTORY_SIZE = 15;
+
+static float FACE_REF_5PTS[5][2] = {
+    {38.2946f, 51.6963f}, {73.5318f, 51.5014f}, {56.0252f, 71.7366f},
+    {41.5493f, 92.3655f}, {70.7299f, 92.2041f}
+};
+
+float get_iou(const cv::Rect& box1, const cv::Rect& box2) {
+    int x1 = std::max(box1.x, box2.x);
+    int y1 = std::max(box1.y, box2.y);
+    int x2 = std::min(box1.x + box1.width, box2.x + box2.width);
+    int y2 = std::min(box1.y + box1.height, box2.y + box2.height);
+    int w = std::max(0, x2 - x1);
+    int h = std::max(0, y2 - y1);
+    float inter = (float)(w * h);
+    float area1 = (float)(box1.width * box1.height);
+    float area2 = (float)(box2.width * box2.height);
+    return inter / (area1 + area2 - inter);
+}
+
+void nms(std::vector<FaceResult>& input, std::vector<FaceResult>& output, float iou_threshold) {
+    auto it = std::remove_if(input.begin(), input.end(), [](const FaceResult& f) {
+        return std::isnan(f.score) || std::isinf(f.score);
+    });
+    input.erase(it, input.end());
+
+    std::sort(input.begin(), input.end(), [](const FaceResult& a, const FaceResult& b) {
+        return a.score > b.score;
+    });
+
+    std::vector<bool> merged(input.size(), false);
+    for (size_t i = 0; i < input.size(); i++) {
+        if (merged[i]) continue;
+        output.push_back(input[i]);
+        for (size_t j = i + 1; j < input.size(); j++) {
+            if (get_iou(input[i].box, input[j].box) > iou_threshold) {
+                merged[j] = true;
+            }
+        }
+    }
+}
 
 FaceSystem::FaceSystem() : env(ORT_LOGGING_LEVEL_WARNING, "FaceSystem") {}
 
-bool FaceSystem::loadModels(const string& detPath, const string& recPath, const string& gaPath) {
+FaceSystem::~FaceSystem() {
+    if (sessDet) delete sessDet;
+    if (sessAge) delete sessAge;
+}
+
+bool FaceSystem::loadModels(const std::string& detPath, const std::string& agePath) {
     try {
-        Ort::SessionOptions options;
-        options.SetIntraOpNumThreads(1);
-        options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
+        Ort::SessionOptions opts;
+        opts.SetIntraOpNumThreads(1);
+        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
 
-        // Load all 3 models
-        wstring wDet(detPath.begin(), detPath.end());
-        wstring wRec(recPath.begin(), recPath.end());
-        wstring wGa(gaPath.begin(), gaPath.end());
-
-        det_session = make_unique<Ort::Session>(env, wDet.c_str(), options);
-        rec_session = make_unique<Ort::Session>(env, wRec.c_str(), options);
-        ga_session  = make_unique<Ort::Session>(env, wGa.c_str(), options);
-
-        // --- PRE-CALCULATE SCRFD METADATA (Safely) ---
-        Ort::AllocatorWithDefaultOptions allocator;
-        
-        // 1. Input Names
-        size_t num_in = det_session->GetInputCount();
-        input_names_stg.clear(); 
-        input_names_ptr.clear();
-        input_names_stg.reserve(num_in);
-        input_names_ptr.reserve(num_in);
-
-        for(size_t i=0; i<num_in; i++) {
-            auto name = det_session->GetInputNameAllocated(i, allocator);
-            input_names_stg.push_back(name.get());
-        }
-        for(size_t i=0; i<num_in; i++) {
-            input_names_ptr.push_back(input_names_stg[i].c_str());
-        }
-
-        // 2. Output Names
-        size_t num_out = det_session->GetOutputCount();
-        output_names_stg.clear(); 
-        output_names_ptr.clear();
-        output_names_stg.reserve(num_out);
-        output_names_ptr.reserve(num_out);
-
-        for(size_t i=0; i<num_out; i++) {
-            auto name = det_session->GetOutputNameAllocated(i, allocator);
-            output_names_stg.push_back(name.get());
-        }
-        for(size_t i=0; i<num_out; i++) {
-             output_names_ptr.push_back(output_names_stg[i].c_str());
-        }
-
+        sessDet = new Ort::Session(env, std::wstring(detPath.begin(), detPath.end()).c_str(), opts);
+        sessAge = new Ort::Session(env, std::wstring(agePath.begin(), agePath.end()).c_str(), opts);
         return true;
-    } catch (const Ort::Exception& e) {
-        cerr << "[AI ERROR]: " << e.what() << endl;
+    } catch (const std::exception& e) {
+        std::cerr << "CRITICAL ERROR Loading Models: " << e.what() << std::endl;
         return false;
     }
 }
 
-// --- 1. DETECTION (SCRFD 9-OUTPUT FORMAT) ---
-vector<FaceObject> FaceSystem::detectSCRFD(const Mat& frame) {
-    vector<FaceObject> faces;
-    try {
-        if (!det_session) { cerr << "Session Null!" << endl; return faces; }
-        if (input_names_ptr.empty()) { cerr << "Names Empty!" << endl; return faces; }
+void process_stride(int stride, const Ort::Value& tScore, const Ort::Value& tBox, const Ort::Value& tKps,
+                    int expected_rows, float rX, float rY,
+                    std::vector<FaceResult>& proposals, float& max_score_seen) {
 
-        // 1. Preprocess: Letterbox to 640x640
-        int target_size = 640;
-        int width = frame.cols;
-        int height = frame.rows;
-        
-        float scale = min((float)target_size / width, (float)target_size / height);
-        int new_w = (int)(width * scale);
-        int new_h = (int)(height * scale);
-        
-        Mat resized_img;
-        resize(frame, resized_img, Size(new_w, new_h));
-        
-        Mat input_img(target_size, target_size, CV_8UC3, Scalar(0, 0, 0));
-        resized_img.copyTo(input_img(Rect(0, 0, new_w, new_h)));
-        
-        // Normalize: (x - 127.5) / 128.0 
-        Mat blob = dnn::blobFromImage(input_img, 1.0/128.0, Size(target_size, target_size), Scalar(127.5, 127.5, 127.5), true, false);
+    auto infoScore = tScore.GetTensorTypeAndShapeInfo();
+    size_t countScore = infoScore.GetElementCount();
+    if (countScore != (size_t)expected_rows) return;
 
-        // 2. Inference
-        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        vector<int64_t> input_shape = {1, 3, target_size, target_size};
-        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, (float*)blob.data, blob.total(), input_shape.data(), 4);
+    const float* scores = tScore.GetTensorData<float>();
+    const float* boxes  = tBox.GetTensorData<float>();
+    const float* kpss   = tKps.GetTensorData<float>();
 
-        auto outputs = det_session->Run(Ort::RunOptions{nullptr}, 
-                                        input_names_ptr.data(), &input_tensor, 1, 
-                                        output_names_ptr.data(), output_names_ptr.size());
-        
-        // 3. Post-Process - SCRFD 9-output format
-        // Model outputs: [score_8, score_16, score_32, bbox_8, bbox_16, bbox_32, kps_8, kps_16, kps_32]
-        // Scores are 2-channel (background, face)
-        
-        struct StrideInfo {
-            int score_idx = -1;
-            int bbox_idx = -1; 
-            int kps_idx = -1;
-            int grid_size = 0;
-        };
-        
-        map<int, StrideInfo> stride_info;
-        stride_info[8].grid_size = 80;
-        stride_info[16].grid_size = 40;
-        stride_info[32].grid_size = 20;
-        
-        // Map outputs by size
-        for(int i=0; i<outputs.size(); i++) {
-            size_t el = outputs[i].GetTensorTypeAndShapeInfo().GetElementCount();
-            
-            // Stride 8 (80x80 grid)
-            if(el == 12800) stride_info[8].score_idx = i;      // 80*80*2
-            else if(el == 51200) stride_info[8].bbox_idx = i;  // 80*80*4*2
-            else if(el == 128000) stride_info[8].kps_idx = i;  // 80*80*10*2
-            
-            // Stride 16 (40x40 grid)
-            else if(el == 3200) stride_info[16].score_idx = i;    // 40*40*2
-            else if(el == 12800) stride_info[16].bbox_idx = i;    // 40*40*4*2
-            else if(el == 32000) stride_info[16].kps_idx = i;     // 40*40*10*2
-            
-            // Stride 32 (20x20 grid)
-            else if(el == 800) stride_info[32].score_idx = i;     // 20*20*2
-            else if(el == 3200) stride_info[32].bbox_idx = i;     // 20*20*4*2
-            else if(el == 8000) stride_info[32].kps_idx = i;      // 20*20*10*2
-        }
+    int num_anchors = 2;
+    int feat_w = 640 / stride;
 
-        int strides[] = {8, 16, 32};  // All scales
-        vector<Rect> boxes;
-        vector<float> confs;
-        vector<vector<Point2f>> all_kpss;
+    for (int i = 0; i < expected_rows; ++i) {
+        float score = scores[i];
+        if (std::isnan(score) || std::isinf(score)) continue;
+        if (score > max_score_seen) max_score_seen = score;
 
-        for(int stride : strides) {
-            auto& info = stride_info[stride];
-            if(info.score_idx == -1 || info.bbox_idx == -1 || info.kps_idx == -1) continue;
-            
-            float* s_ptr = outputs[info.score_idx].GetTensorMutableData<float>();
-            float* b_ptr = outputs[info.bbox_idx].GetTensorMutableData<float>();
-            float* k_ptr = outputs[info.kps_idx].GetTensorMutableData<float>();
-            
-            int grid = info.grid_size;
-            
-            for(int cy=0; cy<grid; cy++) {
-                for(int cx=0; cx<grid; cx++) {
-                    int idx = cy * grid + cx;
-                    
-                    // Score is 2-channel: [background, face]
-                    // Use softmax: exp(face) / (exp(bg) + exp(face))
-                    float score_bg = s_ptr[idx * 2 + 0];
-                    float score_face = s_ptr[idx * 2 + 1];
-                    
-                    float exp_bg = exp(score_bg);
-                    float exp_face = exp(score_face);
-                    float score = exp_face / (exp_bg + exp_face);
-                    
-                    // Balanced threshold
-                    if(score < 0.7f) continue;
-                    
-                    float anchor_x = (cx + 0.5f) * stride;
-                    float anchor_y = (cy + 0.5f) * stride;
-                    
-                    // BBox: distance format
-                    float dx1 = b_ptr[idx*4 + 0] * stride;
-                    float dy1 = b_ptr[idx*4 + 1] * stride;
-                    float dx2 = b_ptr[idx*4 + 2] * stride;
-                    float dy2 = b_ptr[idx*4 + 3] * stride;
-                    
-                    float x1 = (anchor_x - dx1) / scale;
-                    float y1 = (anchor_y - dy1) / scale;
-                    float x2 = (anchor_x + dx2) / scale;
-                    float y2 = (anchor_y + dy2) / scale;
-                    
-                    // Bbox validation - must be reasonable size
-                    float w = x2 - x1;
-                    float h = y2 - y1;
-                    
-                    // Filter out invalid boxes
-                    if(w < 10 || h < 10 || w > 1000 || h > 1000) continue;
-                    if(w/h > 3.0f || h/w > 3.0f) continue;  // Aspect ratio check
-                    
-                    // Landmarks
-                    vector<Point2f> kps;
-                    for(int k=0; k<5; k++) {
-                       float kx = (anchor_x + k_ptr[idx*10 + k*2] * stride) / scale;
-                       float ky = (anchor_y + k_ptr[idx*10 + k*2 + 1] * stride) / scale;
-                       kps.push_back(Point2f(kx, ky));
-                    }
-                    
-                    boxes.push_back(Rect(x1, y1, x2-x1, y2-y1));
-                    confs.push_back(score);
-                    all_kpss.push_back(kps);
-                }
+        if (score > 0.40f) {
+            int pixel_idx = i / num_anchors;
+            int y = pixel_idx / feat_w;
+            int x = pixel_idx % feat_w;
+
+            float anchor_x = x * stride;
+            float anchor_y = y * stride;
+
+            float l = boxes[i * 4 + 0] * stride;
+            float t = boxes[i * 4 + 1] * stride;
+            float r = boxes[i * 4 + 2] * stride;
+            float b = boxes[i * 4 + 3] * stride;
+
+            FaceResult face;
+            face.score = score;
+            face.box.x = (int)((anchor_x - l) * rX);
+            face.box.y = (int)((anchor_y - t) * rY);
+            face.box.width = (int)((l + r) * rX);
+            face.box.height = (int)((t + b) * rY);
+
+            for (int k = 0; k < 5; k++) {
+                float kx = kpss[i * 10 + (k * 2)] * stride;
+                float ky = kpss[i * 10 + (k * 2 + 1)] * stride;
+                face.kps.push_back(cv::Point2f((anchor_x + kx) * rX, (anchor_y + ky) * rY));
             }
+            proposals.push_back(face);
         }
-        
-        // NMS - standard
-        vector<int> indices;
-        dnn::NMSBoxes(boxes, confs, 0.5f, 0.45f, indices);
-        
-        vector<FaceObject> temp_faces;
-        for(int idx : indices) {
-            FaceObject obj;
-            obj.box = boxes[idx];
-            obj.confidence = confs[idx];
-            obj.landmarks = all_kpss[idx];
-            temp_faces.push_back(obj);
-        }
-        
-        // --- KEY FIX: Keep ONLY the BEST face (Highest Confidence) ---
-        // The real face usually has the highest score, while background noise is lower
-        if(!temp_faces.empty()) {
-            // Sort by Confidence (descending)
-            std::sort(temp_faces.begin(), temp_faces.end(), [](const FaceObject& a, const FaceObject& b) {
-                return a.confidence > b.confidence;
-            });
-            
-            // Keep ONLY the most confident detection
-            FaceObject& best_face = temp_faces[0];
-            
-            // --- Expand Box (Padding) ---
-            // User requested bigger box: Add 20% padding
-            float pad_x = best_face.box.width * 0.2f;
-            float pad_y = best_face.box.height * 0.2f;
-            
-            best_face.box.x -= pad_x;
-            best_face.box.y -= pad_y;
-            best_face.box.width += (pad_x * 2);
-            best_face.box.height += (pad_y * 2);
-            
-            // Clamp to frame boundaries
-            // Note: We don't have frame size here easily, but cv::Rect handles intersections well usually,
-            // or we can just rely on the drawing loop to handle clipping, but for safety:
-            // Since we passed 'frame' to this function, we can check boundaries:
-            best_face.box &= Rect(0, 0, frame.cols, frame.rows); // Intersection limits it
-            
-            faces.push_back(best_face);
-        }
-
-    } catch (const Ort::Exception& e) {
-        cerr << "[AI ERROR] SCRFD Inference failed: " << e.what() << endl;
     }
-
-    return faces;
 }
 
-// --- 2. ALIGNMENT (Warp Affine) ---
-Mat FaceSystem::alignFace(const Mat& frame, const vector<Point2f>& kps) {
-    // Standard InsightFace 112x112 target points
-    float target[5][2] = {
-        {38.2946f, 51.6963f}, {73.5318f, 51.5014f},
-        {56.0252f, 71.7366f},
-        {41.5493f, 92.3655f}, {70.7299f, 92.2041f}
-    };
+std::vector<FaceResult> run_inference_pass(Ort::Session* sess, const cv::Mat& img,
+                                           double scalefactor, cv::Scalar mean, bool swapRB,
+                                           const std::vector<const char*>& inputNames,
+                                           const std::vector<const char*>& outputNames,
+                                           float& max_score_out) {
+    try {
+        cv::Mat blob;
+        cv::dnn::blobFromImage(img, blob, scalefactor, cv::Size(640, 640), mean, swapRB, false);
 
-    Mat src(5, 2, CV_32F);
-    Mat dst(5, 2, CV_32F, target);
-    for(int i=0; i<5; i++) {
-        src.at<float>(i,0) = kps[i].x;
-        src.at<float>(i,1) = kps[i].y;
-    }
+        std::vector<int64_t> inputShape = {1, 3, 640, 640};
+        auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::Value inputOrt = Ort::Value::CreateTensor<float>(memoryInfo, (float*)blob.data, 640*640*3, inputShape.data(), inputShape.size());
 
-    Mat M = estimateAffinePartial2D(src, dst);
-    Mat aligned;
-    warpAffine(frame, aligned, M, Size(112, 112));
+        auto outputTensors = sess->Run(Ort::RunOptions{nullptr}, inputNames.data(), &inputOrt, 1, outputNames.data(), outputNames.size());
+        if (outputTensors.size() < 9) return {};
+
+        std::vector<FaceResult> proposals;
+        float rX = (float)img.cols / 640;
+        float rY = (float)img.rows / 640;
+
+        process_stride(8, outputTensors[0], outputTensors[3], outputTensors[6], 12800, rX, rY, proposals, max_score_out);
+        process_stride(16, outputTensors[1], outputTensors[4], outputTensors[7], 3200, rX, rY, proposals, max_score_out);
+        process_stride(32, outputTensors[2], outputTensors[5], outputTensors[8], 800, rX, rY, proposals, max_score_out);
+
+        return proposals;
+    } catch (const std::exception& e) { return {}; }
+}
+
+std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
+    if (img.empty()) return {};
+
+    try {
+        Ort::AllocatorWithDefaultOptions allocator;
+        auto inputNamePtr = sessDet->GetInputNameAllocated(0, allocator);
+        std::string inputNameStr = inputNamePtr.get();
+        const char* inputNames[] = { inputNameStr.c_str() };
+
+        size_t numOutputs = sessDet->GetOutputCount();
+        std::vector<std::string> outputNameStrings;
+        outputNameStrings.reserve(numOutputs);
+        for(size_t i = 0; i < numOutputs; i++) {
+            auto namePtr = sessDet->GetOutputNameAllocated(i, allocator);
+            outputNameStrings.push_back(namePtr.get());
+        }
+        std::vector<const char*> outputNames;
+        outputNames.reserve(numOutputs);
+        for(const auto& s : outputNameStrings) outputNames.push_back(s.c_str());
+
+        float max_score = 0.0f;
+        std::vector<FaceResult> faces = run_inference_pass(sessDet, img, 1.0/128.0, cv::Scalar(127.5, 127.5, 127.5), true, {inputNames[0]}, outputNames, max_score);
+
+        std::vector<FaceResult> nms_faces;
+        nms(faces, nms_faces, 0.4f);
+
+        if (nms_faces.empty()) return {};
+
+        std::sort(nms_faces.begin(), nms_faces.end(), [](const FaceResult& a, const FaceResult& b) {
+            return (a.box.width * a.box.height) > (b.box.width * b.box.height);
+        });
+
+        FaceResult& mainFace = nms_faces[0];
+        runAgeGender(img, nms_faces);
+        return { mainFace };
+
+    } catch (...) { return {}; }
+}
+
+cv::Mat FaceSystem::alignFace(const cv::Mat& img, const std::vector<cv::Point2f>& kps) {
+    if (kps.size() < 5) return cv::Mat();
+    std::vector<cv::Point2f> dstPts;
+    for (int i = 0; i < 5; ++i) dstPts.push_back(cv::Point2f(FACE_REF_5PTS[i][0], FACE_REF_5PTS[i][1]));
+    cv::Mat M = cv::estimateAffinePartial2D(kps, dstPts);
+    if (M.empty()) return cv::Mat();
+    cv::Mat aligned;
+    cv::warpAffine(img, aligned, M, cv::Size(112, 112));
     return aligned;
 }
 
-// --- 3. RECOGNITION & AGE ---
-void FaceSystem::analyzeFace(const Mat& frame, FaceObject& face) {
-    Mat aligned = alignFace(frame, face.landmarks);
+void FaceSystem::runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces) {
+    if (!sessAge || faces.empty()) return;
 
-    // B. Run Gender/Age
-    if(ga_session) {
-         try {
-            Mat blobGA = dnn::blobFromImage(aligned, 1.0, Size(96, 96), Scalar(0,0,0), true);
-            auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-            int64_t shapeGA[] = {1, 3, 96, 96};
-            Ort::Value tensorGA = Ort::Value::CreateTensor<float>(memory, (float*)blobGA.data, blobGA.total(), shapeGA, 4);
+    try {
+        Ort::AllocatorWithDefaultOptions allocator;
+        auto inputNamePtr = sessAge->GetInputNameAllocated(0, allocator);
+        std::string inputNameStr = inputNamePtr.get();
+        const char* inputNames[] = { inputNameStr.c_str() };
+        auto outputNamePtr = sessAge->GetOutputNameAllocated(0, allocator);
+        std::string outputNameStr = outputNamePtr.get();
+        const char* outputNames[] = { outputNameStr.c_str() };
 
-            Ort::AllocatorWithDefaultOptions allocator;
-            auto name_in_ptr = ga_session->GetInputNameAllocated(0, allocator);
-            auto name_out_ptr = ga_session->GetOutputNameAllocated(0, allocator);
-            const char* in_name = name_in_ptr.get();
-            const char* out_name = name_out_ptr.get();
+        FaceResult& face = faces[0];
+        cv::Mat aligned = alignFace(img, face.kps);
 
-            auto outGA_vals = ga_session->Run(Ort::RunOptions{nullptr}, &in_name, &tensorGA, 1, &out_name, 1);
-            float* ga_data = outGA_vals[0].GetTensorMutableData<float>();
-            
-            // Gender: [0]=Male, [1]=Female
-            // Smooth the difference: (Male - Female)
-            float raw_diff = ga_data[0] - ga_data[1];
-            
-            // Initialize or Smooth
-            if(smoothed_age < 0) smoothed_gender_diff = raw_diff; // Init
-            else smoothed_gender_diff = (smoothed_gender_diff * 0.8f) + (raw_diff * 0.2f);
-            
-            face.gender = (smoothed_gender_diff > 0) ? "M" : "F";
-            
-            // Age: Model outputs 0-1 range, multiply by 100
-            float raw_age = ga_data[2];
-            float current_age = raw_age * 100.0f;
-            
-            // --- EMA Smoothing (Butter Smooth) ---
-            if(smoothed_age < 0) {
-                smoothed_age = current_age; // Initialize
-            } else {
-                // Alpha 0.15 = Smooth
-                float alpha = 0.15f; 
-                smoothed_age = (smoothed_age * (1.0f - alpha)) + (current_age * alpha);
-            }
-            
-            face.age = (int)smoothed_age;
-            
-         } catch(std::exception& e) {
-             cerr << "GA Error: " << e.what() << endl;
-         }
+        // Keep visual debug for confirmation
+        if (!aligned.empty()) {
+            cv::Mat debugROI = img(cv::Rect(0, 0, 96, 96));
+            cv::Mat resized;
+            cv::resize(aligned, resized, cv::Size(96,96));
+            resized.copyTo(debugROI);
+            cv::putText(const_cast<cv::Mat&>(img), "AI Input", cv::Point(5, 15),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1);
+        }
+
+        // --- CRITICAL FIX: SCALE 1.0 (NO NORM) ---
+        // Some Age models hate the 1/128 scaling. We try Scale 1.0 (Raw Pixels).
+        // If this doesn't work, the next step is 1.0/255.0.
+        cv::Mat blob;
+        cv::dnn::blobFromImage(aligned, blob, 1.0, cv::Size(96, 96), cv::Scalar(0, 0, 0), true, false);
+
+        std::vector<int64_t> inputShape = {1, 3, 96, 96};
+        auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::Value inputOrt = Ort::Value::CreateTensor<float>(memoryInfo, (float*)blob.data, 96*96*3, inputShape.data(), inputShape.size());
+
+        auto outputTensors = sessAge->Run(Ort::RunOptions{nullptr}, inputNames, &inputOrt, 1, outputNames, 1);
+        float* outputData = outputTensors[0].GetTensorMutableData<float>();
+
+        // Log to console so we can see the change
+        std::cout << "Raw Age Data (NoScale): " << outputData[2] * 100 << std::endl;
+
+        int cur_gender = (outputData[1] > outputData[0]) ? 1 : 0;
+        int cur_age = static_cast<int>(outputData[2] * 100);
+
+        age_history.push_back(cur_age);
+        gender_history.push_back(cur_gender);
+        if (age_history.size() > HISTORY_SIZE) age_history.pop_front();
+        if (gender_history.size() > HISTORY_SIZE) gender_history.pop_front();
+
+        long sum = 0; for(int a : age_history) sum+=a;
+        face.age = sum / age_history.size();
+
+        int male_votes = 0; for(int g : gender_history) male_votes+=g;
+        face.gender = (male_votes > (int)gender_history.size()/2) ? 1 : 0;
+    } catch (...) {
+        faces[0].age = -1;
     }
-
-    // C. Skip Recognition (not needed for display, slows down FPS)
-    /*
-    if(rec_session) {
-        // ... code ...
-    }
-    */
 }
 
-// --- MAIN LOOP ---
-void FaceSystem::runWebcam() {
-    VideoCapture cap(0);
-    
-    if(!cap.isOpened()) {
-        cerr << "[ERROR] Could not open camera!" << endl;
-        return;
-    }
-    
-    // Brief warmup
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    
-    Mat frame;
-
-    while(true) {
-        cap >> frame;
-        
-        if(frame.empty()) {
-            cerr << "[ERROR] Empty frame!" << endl;
-            break;
-        }
-
-        // 1. Detect
-        vector<FaceObject> faces = detectSCRFD(frame);
-        
-        // Reset smoothing if lost face
-        if(faces.empty()) {
-            smoothed_age = -1.0f;
-            smoothed_gender_diff = 0.0f;
-        }
-
-        // 2. Analyze & Draw
-        for(auto& face : faces) {
-            try {
-                analyzeFace(frame, face);
-            } catch(std::exception& e) {
-                cerr << "[ERROR] analyzeFace failed: " << e.what() << endl;
-                continue;  // Skip this face
-            }
-
-            // --- Professional UI Drawing ---
-            
-            // Color scheme: Blue for Male, Pink/Red for Female
-            Scalar color = (face.gender == "M") ? Scalar(255, 100, 0) : Scalar(147, 20, 255); // BGR
-            
-            // 1. Draw Box
-            rectangle(frame, face.box, color, 2);
-            
-            // 2. Draw Landmarks (Subtle White)
-            for(auto& p : face.landmarks) circle(frame, p, 2, Scalar(255, 255, 255), -1);
-            
-            // 3. Draw Label with Background
-            string gender_text = (face.gender == "M") ? "Male" : "Female";
-            string label = gender_text + ", Age: " + to_string(face.age);
-            
-            int baseLine;
-            Size labelSize = getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.6, 2, &baseLine);
-            
-            // Label Background Rect (Above box)
-            Rect labelRect(face.box.x, face.box.y - labelSize.height - 10, labelSize.width + 10, labelSize.height + 10);
-            
-            // Ensure label stays inside frame
-            if (labelRect.y < 0) labelRect.y = face.box.y + face.box.height; // Move to bottom if clipped
-            
-            rectangle(frame, labelRect, color, FILLED);
-            
-            // White Text
-            putText(frame, label, Point(labelRect.x + 5, labelRect.y + labelSize.height + 2), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
-        }
-
-        imshow("InsightFace Professional", frame);
-        int key = waitKey(1);
-        if(key == 27) break;  // ESC to exit
-    }
-}
+// Stub for linker
+std::vector<FaceResult> FaceSystem::runSCRFD(const cv::Mat&) { return {}; }
