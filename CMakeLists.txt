@@ -3,12 +3,23 @@ cmake_minimum_required(VERSION 3.16)
 # Project Name
 project(FaceDetector LANGUAGES CXX)
 
+# Default to Release build if not specified
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # -----------------------------------------------------------------------------
+# 1. Setup Environment Paths (For Qt Creator)
+# -----------------------------------------------------------------------------
+# Add known paths to CMAKE_PREFIX_PATH so find_package works automatically
+list(APPEND CMAKE_PREFIX_PATH "C:/3rdParty/opencv")
+list(APPEND CMAKE_PREFIX_PATH "C:/Users/user/Documents/6.9.3/msvc2022_64")
+
 # 1. Setup Qt
 # -----------------------------------------------------------------------------
 find_package(Qt6 COMPONENTS Widgets REQUIRED)
