@@ -1,10 +1,9 @@
 #pragma once
 
 #include <QMainWindow>
-#include <QPushButton>
 #include <QLabel>
-#include <QVBoxLayout>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <opencv2/opencv.hpp>
 #include "facesystem.h"
 
@@ -12,23 +11,20 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 
 public:
-    MainWindow(QWidget *parent = nullptr);
+    explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
 private slots:
-    void onStartCamera(); // Starts/Stops the webcam
-    void updateFrame();   // Called repeatedly by QTimer
+    void processFrame(); // Function called every frame
 
 private:
-    QWidget *centralWidget;
-    QVBoxLayout *layout;
-    QLabel *imageLabel;
-    QPushButton *btnStart;
+    QLabel *videoLabel;       // The widget that shows the video
+    cv::VideoCapture cap;     // Webcam
+    QTimer *timer;            // Loop timer
+    FaceSystem faceSystem;    // Your AI System
 
-    // Camera Resources
-    cv::VideoCapture cap;
-    QTimer *timer;
-
-    // Face Engine
-    FaceSystem faceSystem;
+    // FPS Counting
+    QElapsedTimer fpsTimer;
+    int fpsCounter = 0;
+    float currentFPS = 0.0f;
 };

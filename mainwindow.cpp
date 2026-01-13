@@ -1,113 +1,92 @@
 #include "mainwindow.h"
-#include <QMessageBox>
+#include <QVBoxLayout>
+#include <QDebug>
 #include <QImage>
 #include <QPixmap>
 
-// Helper: Convert cv::Mat to QImage
-QImage cvMatToQImage(const cv::Mat &inMat) {
-    switch (inMat.type()) {
-    case CV_8UC4: {
-        QImage image(inMat.data, inMat.cols, inMat.rows, static_cast<int>(inMat.step), QImage::Format_ARGB32);
-        return image.copy();
-    }
-    case CV_8UC3: {
-        QImage image(inMat.data, inMat.cols, inMat.rows, static_cast<int>(inMat.step), QImage::Format_RGB888);
-        return image.rgbSwapped();
-    }
-    default: return QImage();
-    }
-}
-
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
-    centralWidget = new QWidget(this);
+    // --- 1. SETUP UI MANUALLY ---
+    QWidget *centralWidget = new QWidget(this);
     setCentralWidget(centralWidget);
-    layout = new QVBoxLayout(centralWidget);
 
-    btnStart = new QPushButton("Start Webcam", this);
-    imageLabel = new QLabel("Click Start to open Camera", this);
-    imageLabel->setAlignment(Qt::AlignCenter);
+    QVBoxLayout *layout = new QVBoxLayout(centralWidget);
+    videoLabel = new QLabel(this);
+    videoLabel->setAlignment(Qt::AlignCenter);
+    videoLabel->setStyleSheet("background-color: black;"); // Make it look nice
+    layout->addWidget(videoLabel);
 
-    // Set a good window size
-    resize(1000, 800);
+    resize(800, 600); // Set default window size
 
-    layout->addWidget(btnStart);
-    layout->addWidget(imageLabel);
+    // --- 2. LOAD AI MODELS ---
+    // Ensure these files are in your "build" folder (where the .exe is)
+    if (!faceSystem.loadModels("det_10g.onnx", "genderage.onnx", "w600k_r50.onnx")) {
+        qDebug() << "CRITICAL ERROR: Failed to load ONNX models!";
+    }
 
-    // Initialize Timer
-    timer = new QTimer(this);
-
-    // Connect Signals
-    connect(btnStart, &QPushButton::clicked, this, &MainWindow::onStartCamera);
-    connect(timer, &QTimer::timeout, this, &MainWindow::updateFrame);
-
-    // Initialize InsightFace Models
-    if (!faceSystem.loadModels("det_10g.onnx", "genderage.onnx")) {
-        QMessageBox::critical(this, "Error", "Failed to load models! Check files next to .exe");
+    // --- 3. START CAMERA ---
+    cap.open(0); // Open default webcam
+    if (!cap.isOpened()) {
+        qDebug() << "Error: Could not open webcam.";
+        videoLabel->setText("Error: No Webcam Found");
+    } else {
+        // --- 4. START LOOP ---
+        fpsTimer.start();
+        timer = new QTimer(this);
+        connect(timer, &QTimer::timeout, this, &MainWindow::processFrame);
+        timer->start(30); // ~30 FPS
     }
 }
 
 MainWindow::~MainWindow() {
-    if (cap.isOpened()) cap.release();
+    cap.release();
 }
 
-void MainWindow::onStartCamera() {
-    if (timer->isActive()) {
-        timer->stop();
-        cap.release();
-        btnStart->setText("Start Webcam");
-        imageLabel->setText("Camera Stopped");
-    } else {
-        // Open Default Camera (Index 0)
-        cap.open(0);
-        if (!cap.isOpened()) {
-            QMessageBox::warning(this, "Error", "Could not access the webcam!");
-            return;
-        }
-        timer->start(30); // 30ms ~ 33 FPS
-        btnStart->setText("Stop Webcam");
-    }
-}
-
-void MainWindow::updateFrame() {
+void MainWindow::processFrame() {
     cv::Mat frame;
-    cap >> frame; // Capture Frame
+    cap >> frame;
     if (frame.empty()) return;
 
-    // Optional: Flip it like a mirror
-    cv::flip(frame, frame, 1);
+    // --- A. RUN FACE SYSTEM ---
+    auto faces = faceSystem.detectAndEstimate(frame);
 
-    // 1. Run Detection & Estimation
-    auto results = faceSystem.detectAndEstimate(frame);
-
-    // 2. Draw Results
-    for (const auto& res : results) {
+    // --- B. DRAW RESULTS ---
+    for (const auto& face : faces) {
         // Green Box
-        cv::rectangle(frame, res.box, cv::Scalar(0, 255, 0), 2);
+        cv::rectangle(frame, face.box, cv::Scalar(0, 255, 0), 2);
 
-        // Landmarks
-        for (const auto& pt : res.kps) {
-            cv::circle(frame, pt, 2, cv::Scalar(0, 0, 255), -1);
-        }
+        // Text Label
+        std::string label = (face.name != "Unknown" ? face.name + ", " : "") +
+                            (face.gender == 1 ? "Male" : "Female") +
+                            ", " + std::to_string(face.age);
 
-        // Text
-        std::string genderStr = (res.gender == 1) ? "Male" : "Female";
-        std::string label = genderStr + ", " + std::to_string(res.age);
-
-        // Draw text background for readability
+        // Black Background for Text
         int baseLine;
-        cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.8, 2, &baseLine);
-        cv::rectangle(frame,
-                      cv::Point(res.box.x, res.box.y - labelSize.height - 5),
-                      cv::Point(res.box.x + labelSize.width, res.box.y),
-                      cv::Scalar(0, 255, 0), -1);
+        cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseLine);
+        cv::rectangle(frame, cv::Point(face.box.x, face.box.y - labelSize.height - 10),
+                      cv::Point(face.box.x + labelSize.width, face.box.y),
+                      cv::Scalar(0, 0, 0), cv::FILLED);
 
-        cv::putText(frame, label, cv::Point(res.box.x, res.box.y - 5),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 2);
+        // White Text
+        cv::putText(frame, label, cv::Point(face.box.x, face.box.y - 5),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
     }
 
-    // 3. Display
-    QImage qImg = cvMatToQImage(frame);
-    imageLabel->setPixmap(QPixmap::fromImage(qImg).scaled(
-        imageLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation
-        ));
+    // --- C. FPS COUNTER ---
+    fpsCounter++;
+    if (fpsTimer.elapsed() >= 500) {
+        currentFPS = fpsCounter / (fpsTimer.elapsed() / 1000.0f);
+        fpsCounter = 0;
+        fpsTimer.restart();
+    }
+    cv::putText(frame, "FPS: " + std::to_string((int)currentFPS), cv::Point(10, 30),
+                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 2);
+
+    // --- D. DISPLAY ON QLABEL ---
+    // OpenCV (BGR) -> Qt (RGB)
+    cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
+    QImage qimg(frame.data, frame.cols, frame.rows, frame.step, QImage::Format_RGB888);
+    videoLabel->setPixmap(QPixmap::fromImage(qimg));
+
+    // Resize label to fit window if needed
+    videoLabel->setScaledContents(true);
 }
