@@ -5,24 +5,31 @@
 #include <cmath>
 #include <deque>
 #include <numeric>
+#include <set>
+#include <fstream>
 
 // --- SETTINGS ---
-const float DETECT_THRESHOLD = 0.25f; // Sensitivity
-const float REC_THRESHOLD = 0.40f;
-const float MATCH_DIST_THRESHOLD = 150.0f;
-const int MAX_MISSING_FRAMES = 15;
-const int HISTORY_SIZE = 30;
-const int ANALYSIS_INTERVAL = 15; // Run analysis every 0.5s
+const float DETECT_THRESHOLD = 0.50f;
+
+// FIX 1: LOWER THRESHOLD (Was 0.40f)
+// 0.30f ensures that once you register a face, it stays registered.
+const float REC_THRESHOLD = 0.30f;
+
+const float MATCH_DIST_THRESHOLD = 200.0f;
+const int MAX_MISSING_FRAMES = 10;
+const int ANALYSIS_INTERVAL = 5;
+
+const int INPUT_W = 640;
+const int INPUT_H = 640;
 
 struct TrackedFace {
     int id;
     cv::Rect box;
-    std::deque<int> age_hist;
-    std::deque<int> gender_hist;
+    int stable_age = 0;
+    int stable_gender = -1;
+    float gender_momentum = 0.0f;
     std::string name;
     std::vector<float> embedding;
-    int stable_age = 0;
-    int stable_gender = 0;
     int missing_frames = 0;
     int frames_since_analysis = 999;
 };
@@ -64,11 +71,9 @@ void nms(std::vector<FaceResult>& input, std::vector<FaceResult>& output, float 
         return f.score < DETECT_THRESHOLD;
     });
     input.erase(it, input.end());
-
     std::sort(input.begin(), input.end(), [](const FaceResult& a, const FaceResult& b) {
         return a.score > b.score;
     });
-
     std::vector<bool> merged(input.size(), false);
     for (size_t i = 0; i < input.size(); i++) {
         if (merged[i]) continue;
@@ -79,9 +84,8 @@ void nms(std::vector<FaceResult>& input, std::vector<FaceResult>& output, float 
     }
 }
 
-// --- FACE SYSTEM IMPLEMENTATION ---
-
-FaceSystem::FaceSystem() : env(ORT_LOGGING_LEVEL_WARNING, "FaceSystem") {}
+// --- FACE SYSTEM ---
+FaceSystem::FaceSystem() : env(ORT_LOGGING_LEVEL_ERROR, "FaceSystem") {}
 
 FaceSystem::~FaceSystem() {
     if (sessDet) delete sessDet;
@@ -94,19 +98,11 @@ bool FaceSystem::loadModels(const std::string& detPath, const std::string& agePa
         Ort::SessionOptions opts;
         opts.SetIntraOpNumThreads(2);
         opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
-
         sessDet = new Ort::Session(env, std::wstring(detPath.begin(), detPath.end()).c_str(), opts);
         sessAge = new Ort::Session(env, std::wstring(agePath.begin(), agePath.end()).c_str(), opts);
         sessRec = new Ort::Session(env, std::wstring(recPath.begin(), recPath.end()).c_str(), opts);
         return true;
-    } catch (const std::exception& e) {
-        std::cerr << "CRITICAL ERROR Loading Models: " << e.what() << std::endl;
-        return false;
-    }
-}
-
-void FaceSystem::registerFace(const std::string& name, const std::vector<float>& embedding) {
-    if(embedding.size() == 512) known_faces[name] = embedding;
+    } catch (const std::exception& e) { return false; }
 }
 
 void process_stride(int stride, const Ort::Value& tScore, const Ort::Value& tBox, const Ort::Value& tKps,
@@ -114,7 +110,7 @@ void process_stride(int stride, const Ort::Value& tScore, const Ort::Value& tBox
     const float* scores = tScore.GetTensorData<float>();
     const float* boxes  = tBox.GetTensorData<float>();
     const float* kpss   = tKps.GetTensorData<float>();
-    int feat_w = 640 / stride;
+    int feat_w = INPUT_W / stride;
 
     for (int i = 0; i < rows; ++i) {
         float score = scores[i];
@@ -124,19 +120,16 @@ void process_stride(int stride, const Ort::Value& tScore, const Ort::Value& tBox
             int x = grid_idx % feat_w;
             float anchor_x = x * stride;
             float anchor_y = y * stride;
-
             FaceResult face;
             face.score = score;
             float l = boxes[i * 4 + 0] * stride;
             float t = boxes[i * 4 + 1] * stride;
             float r = boxes[i * 4 + 2] * stride;
             float b = boxes[i * 4 + 3] * stride;
-
             face.box.x = (int)((anchor_x - l) * rX);
             face.box.y = (int)((anchor_y - t) * rY);
             face.box.width = (int)((l + r) * rX);
             face.box.height = (int)((t + b) * rY);
-
             for (int k = 0; k < 5; k++) {
                 float kx = kpss[i * 10 + (k * 2)] * stride;
                 float ky = kpss[i * 10 + (k * 2 + 1)] * stride;
@@ -158,44 +151,51 @@ cv::Mat FaceSystem::alignFace(const cv::Mat& img, const std::vector<cv::Point2f>
     return aligned;
 }
 
-// --- MAIN LOOP ---
+cv::Mat FaceSystem::alignFaceZoomed(const cv::Mat& img, const std::vector<cv::Point2f>& kps) {
+    if (kps.size() < 5) return cv::Mat();
+    std::vector<cv::Point2f> dstPts;
+    float scale = 0.80f;
+    float cx = FACE_REF_5PTS[2][0];
+    float cy = FACE_REF_5PTS[2][1];
+    for (int i = 0; i < 5; ++i) {
+        float x = FACE_REF_5PTS[i][0];
+        float y = FACE_REF_5PTS[i][1];
+        x = cx + (x - cx) * scale;
+        y = cy + (y - cy) * scale;
+        dstPts.push_back(cv::Point2f(x, y));
+    }
+    cv::Mat M = cv::estimateAffinePartial2D(kps, dstPts);
+    if (M.empty()) return cv::Mat();
+    cv::Mat aligned;
+    cv::warpAffine(img, aligned, M, cv::Size(112, 112));
+    return aligned;
+}
+
 std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
     if (img.empty()) return {};
-
     try {
         Ort::AllocatorWithDefaultOptions allocator;
-
-        // --- 1. SAFE MEMORY MANAGEMENT FOR NAMES ---
-        // Get Input Name
         auto inputNamePtr = sessDet->GetInputNameAllocated(0, allocator);
         const char* inputNames[] = { inputNamePtr.get() };
-
-        // Get Output Names (Keep smart pointers alive in a vector)
         size_t numOutputs = sessDet->GetOutputCount();
-        std::vector<Ort::AllocatedStringPtr> outputNamePtrs; // Keeps memory alive
-        std::vector<const char*> outputNames;                // Passed to Run()
-
+        std::vector<Ort::AllocatedStringPtr> outputNamePtrs;
+        std::vector<const char*> outputNames;
         for(size_t i=0; i<numOutputs; i++) {
             auto ptr = sessDet->GetOutputNameAllocated(i, allocator);
             outputNames.push_back(ptr.get());
             outputNamePtrs.push_back(std::move(ptr));
         }
 
-        // --- 2. PREPROCESS ---
         cv::Mat blob;
-        cv::dnn::blobFromImage(img, blob, 1.0/128.0, cv::Size(640, 640), cv::Scalar(127.5, 127.5, 127.5), true, false);
-
-        std::vector<int64_t> inputShape = {1, 3, 640, 640};
+        cv::dnn::blobFromImage(img, blob, 1.0/128.0, cv::Size(INPUT_W, INPUT_H), cv::Scalar(127.5, 127.5, 127.5), true, false);
+        std::vector<int64_t> inputShape = {1, 3, INPUT_H, INPUT_W};
         auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        Ort::Value inputOrt = Ort::Value::CreateTensor<float>(memoryInfo, (float*)blob.data, 640*640*3, inputShape.data(), inputShape.size());
-
-        // --- 3. RUN ---
+        Ort::Value inputOrt = Ort::Value::CreateTensor<float>(memoryInfo, (float*)blob.data, INPUT_H*INPUT_W*3, inputShape.data(), inputShape.size());
         auto outputs = sessDet->Run(Ort::RunOptions{nullptr}, inputNames, &inputOrt, 1, outputNames.data(), outputNames.size());
 
-        // --- 4. PARSE ---
         std::vector<FaceResult> proposals;
-        float rX = (float)img.cols / 640;
-        float rY = (float)img.rows / 640;
+        float rX = (float)img.cols / INPUT_W;
+        float rY = (float)img.rows / INPUT_H;
         process_stride(8, outputs[0], outputs[3], outputs[6], 12800, rX, rY, proposals);
         process_stride(16, outputs[1], outputs[4], outputs[7], 3200, rX, rY, proposals);
         process_stride(32, outputs[2], outputs[5], outputs[8], 800, rX, rY, proposals);
@@ -203,102 +203,85 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
         std::vector<FaceResult> nms_faces;
         nms(proposals, nms_faces, 0.45f);
 
-        if (nms_faces.empty()) {
-            for (auto& t : tracker_db) t.missing_frames++;
-            return {};
-        }
+        for (auto& t : tracker_db) { t.missing_frames++; t.frames_since_analysis++; }
+        if (nms_faces.empty()) return {};
 
-        // --- 5. TRACKER ---
-        for (auto& t : tracker_db) {
-            t.missing_frames++;
-            t.frames_since_analysis++;
-        }
-
+        std::set<int> used_trackers;
         std::vector<FaceResult> final_results;
 
         for (const auto& detected : nms_faces) {
+            std::vector<FaceResult> tempSingle = {detected};
+            runRecognition(img, tempSingle);
+            FaceResult& fresh = tempSingle[0];
+
             int best_idx = -1;
             float min_dist = MATCH_DIST_THRESHOLD;
-            float cx = detected.box.x + detected.box.width / 2.0f;
-            float cy = detected.box.y + detected.box.height / 2.0f;
+            float cx = fresh.box.x + fresh.box.width / 2.0f;
+            float cy = fresh.box.y + fresh.box.height / 2.0f;
 
             for (size_t i = 0; i < tracker_db.size(); i++) {
+                if (used_trackers.count(i)) continue;
                 TrackedFace& t = tracker_db[i];
                 float tx = t.box.x + t.box.width / 2.0f;
                 float ty = t.box.y + t.box.height / 2.0f;
                 float dist = std::sqrt(std::pow(cx - tx, 2) + std::pow(cy - ty, 2));
-                if (dist < min_dist) { min_dist = dist; best_idx = i; }
+                float similarity = calculateSimilarity(fresh.embedding, t.embedding);
+                bool looks_same = (t.embedding.empty() || similarity > 0.35f);
+
+                if (dist < min_dist && looks_same) { min_dist = dist; best_idx = i; }
             }
 
             if (best_idx != -1) {
-                // MATCHED
+                used_trackers.insert(best_idx);
                 TrackedFace& t = tracker_db[best_idx];
-                t.box = detected.box;
+                t.box = fresh.box;
                 t.missing_frames = 0;
 
-                // Update Logic: Check Age/Rec periodically
-                if (t.frames_since_analysis >= ANALYSIS_INTERVAL || t.age_hist.size() < 5) {
-                    std::vector<FaceResult> single = {detected};
-                    runAgeGender(img, single);
-                    runRecognition(img, single);
+                if (t.frames_since_analysis >= ANALYSIS_INTERVAL || t.gender_momentum == 0.0f) {
+                    runAgeGender(img, tempSingle);
 
-                    FaceResult& fresh = single[0];
-                    t.age_hist.push_back(fresh.age);
-                    t.gender_hist.push_back(fresh.gender);
-                    if(t.age_hist.size() > HISTORY_SIZE) t.age_hist.pop_front();
-                    if(t.gender_hist.size() > HISTORY_SIZE) t.gender_hist.pop_front();
+                    if (fresh.gender != -1) {
+                        float update_val = (fresh.gender == 1) ? 3.0f : -3.0f;
+                        t.gender_momentum += update_val;
+                    }
+                    if (t.gender_momentum > 25.0f) t.gender_momentum = 25.0f;
+                    if (t.gender_momentum < -25.0f) t.gender_momentum = -25.0f;
+                    t.stable_gender = (t.gender_momentum >= 0) ? 1 : 0;
 
-                    long sum = 0; for(int a : t.age_hist) sum+=a;
-                    t.stable_age = sum / t.age_hist.size();
-
-                    int m_vote = 0; for(int g : t.gender_hist) m_vote+=g;
-                    t.stable_gender = (m_vote > (int)t.gender_hist.size()/2) ? 1 : 0;
+                    if (t.stable_age == 0) t.stable_age = fresh.age;
+                    else t.stable_age = static_cast<int>((fresh.age * 0.15f) + (t.stable_age * 0.85f));
 
                     if (fresh.name != "Unknown") t.name = fresh.name;
                     t.embedding = fresh.embedding;
                     t.frames_since_analysis = 0;
                 }
-
-                FaceResult res = detected;
+                FaceResult res = fresh;
                 res.age = t.stable_age;
                 res.gender = t.stable_gender;
                 res.name = t.name.empty() ? "Unknown" : t.name;
-                res.embedding = t.embedding;
                 final_results.push_back(res);
-
             } else {
-                // NEW FACE
-                std::vector<FaceResult> single = {detected};
-                runAgeGender(img, single);
-                runRecognition(img, single);
-                FaceResult& fresh = single[0];
-
+                runAgeGender(img, tempSingle);
+                FaceResult& fresh = tempSingle[0];
                 TrackedFace t;
                 t.id = next_face_id++;
                 t.box = fresh.box;
-                t.age_hist.push_back(fresh.age);
-                t.gender_hist.push_back(fresh.gender);
+                int startGender = (fresh.gender == -1) ? 0 : fresh.gender;
+                t.gender_momentum = (startGender == 1) ? 5.0f : -5.0f;
+                t.stable_gender = startGender;
                 t.stable_age = fresh.age;
-                t.stable_gender = fresh.gender;
                 t.name = fresh.name;
                 t.embedding = fresh.embedding;
                 t.frames_since_analysis = 0;
-
                 tracker_db.push_back(t);
                 final_results.push_back(fresh);
             }
         }
-
         tracker_db.erase(std::remove_if(tracker_db.begin(), tracker_db.end(), [](const TrackedFace& t){
                              return t.missing_frames > MAX_MISSING_FRAMES;
                          }), tracker_db.end());
-
         return final_results;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Run Error: " << e.what() << std::endl;
-        return {};
-    }
+    } catch (...) { return {}; }
 }
 
 void FaceSystem::runRecognition(const cv::Mat& img, std::vector<FaceResult>& faces) {
@@ -309,22 +292,17 @@ void FaceSystem::runRecognition(const cv::Mat& img, std::vector<FaceResult>& fac
         auto outputNamePtr = sessRec->GetOutputNameAllocated(0, allocator);
         const char* inName = inputNamePtr.get();
         const char* outName = outputNamePtr.get();
-
         for (auto& face : faces) {
             cv::Mat aligned = alignFace(img, face.kps);
             if (aligned.empty()) continue;
-
             cv::Mat blob;
             cv::dnn::blobFromImage(aligned, blob, 1.0/127.5, cv::Size(112, 112), cv::Scalar(127.5, 127.5, 127.5), true, false);
             std::vector<int64_t> inputShape = {1, 3, 112, 112};
             auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
             Ort::Value inputOrt = Ort::Value::CreateTensor<float>(memoryInfo, (float*)blob.data, 112*112*3, inputShape.data(), inputShape.size());
-
             auto outputs = sessRec->Run(Ort::RunOptions{nullptr}, &inName, &inputOrt, 1, &outName, 1);
             float* outputData = outputs[0].GetTensorMutableData<float>();
-
             face.embedding.assign(outputData, outputData + 512);
-
             float max_sim = 0.0f;
             std::string best_name = "Unknown";
             for (auto const& [name, known_emb] : known_faces) {
@@ -344,21 +322,116 @@ void FaceSystem::runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces
         auto outputNamePtr = sessAge->GetOutputNameAllocated(0, allocator);
         const char* inName = inputNamePtr.get();
         const char* outName = outputNamePtr.get();
-
         for (auto& face : faces) {
-            cv::Mat aligned = alignFace(img, face.kps);
-            if (aligned.empty()) continue;
-            cv::Mat blob;
-            cv::dnn::blobFromImage(aligned, blob, 1.0, cv::Size(96, 96), cv::Scalar(0, 0, 0), true, false);
-            std::vector<int64_t> inputShape = {1, 3, 96, 96};
-            auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-            Ort::Value inputOrt = Ort::Value::CreateTensor<float>(memoryInfo, (float*)blob.data, 96*96*3, inputShape.data(), inputShape.size());
-
-            auto outputs = sessAge->Run(Ort::RunOptions{nullptr}, &inName, &inputOrt, 1, &outName, 1);
-            float* outputData = outputs[0].GetTensorMutableData<float>();
-
-            face.gender = (outputData[1] > outputData[0]) ? 1 : 0;
-            face.age = static_cast<int>(outputData[2] * 100);
+            // PASS 1: GENDER (Standard)
+            cv::Mat alignedStandard = alignFace(img, face.kps);
+            if (!alignedStandard.empty()) {
+                cv::Mat blob;
+                cv::dnn::blobFromImage(alignedStandard, blob, 1.0, cv::Size(96, 96), cv::Scalar(0, 0, 0), true, false);
+                std::vector<int64_t> inputShape = {1, 3, 96, 96};
+                auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+                Ort::Value inputOrt = Ort::Value::CreateTensor<float>(memoryInfo, (float*)blob.data, 96*96*3, inputShape.data(), inputShape.size());
+                auto outputs = sessAge->Run(Ort::RunOptions{nullptr}, &inName, &inputOrt, 1, &outName, 1);
+                float* outputData = outputs[0].GetTensorMutableData<float>();
+                float femaleProb = outputData[0];
+                float maleProb   = outputData[1];
+                if (std::abs(maleProb - femaleProb) > 0.10f) {
+                    faces[0].gender = (maleProb > femaleProb) ? 1 : 0;
+                } else {
+                    faces[0].gender = -1;
+                }
+            }
+            // PASS 2: AGE (Zoomed)
+            cv::Mat alignedZoomed = alignFaceZoomed(img, face.kps);
+            if (!alignedZoomed.empty()) {
+                cv::Mat blob;
+                cv::dnn::blobFromImage(alignedZoomed, blob, 1.0, cv::Size(96, 96), cv::Scalar(0, 0, 0), true, false);
+                std::vector<int64_t> inputShape = {1, 3, 96, 96};
+                auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+                Ort::Value inputOrt = Ort::Value::CreateTensor<float>(memoryInfo, (float*)blob.data, 96*96*3, inputShape.data(), inputShape.size());
+                auto outputs = sessAge->Run(Ort::RunOptions{nullptr}, &inName, &inputOrt, 1, &outName, 1);
+                float* outputData = outputs[0].GetTensorMutableData<float>();
+                float rawAge = outputData[2] * 100.0f;
+                int finalAge = (int)rawAge;
+                if (rawAge > 50.0f) {
+                    float boost = (rawAge - 50.0f) * 0.8f;
+                    finalAge = (int)(rawAge + boost);
+                }
+                faces[0].age = finalAge;
+            }
         }
     } catch(...) {}
+}
+
+// --- FIX 2: AGGRESSIVE REGISTER FACE ---
+// Forces the tracker to take the name immediately
+void FaceSystem::registerFace(const std::string& newName, const std::string& oldName, const std::vector<float>& embedding) {
+    if (embedding.size() != 512) return;
+
+    // 1. Update Database map
+    if (oldName != "Unknown" && oldName.rfind("ID:", 0) != 0 && known_faces.count(oldName)) {
+        known_faces.erase(oldName);
+    }
+    known_faces[newName] = embedding;
+
+    // 2. FORCE UPDATE TRACKER
+    // Instead of relying on exact name match, find the tracker that matches this embedding best
+    float bestSim = 0.0f;
+    TrackedFace* bestMatch = nullptr;
+
+    for (auto& t : tracker_db) {
+        float sim = calculateSimilarity(t.embedding, embedding);
+        // Find the tracker most similar to the face we just registered
+        if (sim > bestSim) {
+            bestSim = sim;
+            bestMatch = &t;
+        }
+    }
+
+    // If we found the tracker (we almost certainly will, since it's on screen), FORCE update it
+    if (bestMatch && bestSim > 0.30f) { // Use same low threshold
+        bestMatch->name = newName;
+        bestMatch->embedding = embedding;
+        std::cout << "Forced tracker update for: " << newName << " (Sim: " << bestSim << ")" << std::endl;
+    }
+}
+
+void FaceSystem::saveDatabase(const std::string& filename) {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out.is_open()) return;
+    size_t count = known_faces.size();
+    out.write((char*)&count, sizeof(count));
+    for (const auto& [name, emb] : known_faces) {
+        size_t len = name.size();
+        out.write((char*)&len, sizeof(len));
+        out.write(name.c_str(), len);
+        out.write((char*)emb.data(), emb.size() * sizeof(float));
+    }
+    out.close();
+}
+
+void FaceSystem::loadDatabase(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) return;
+    size_t count;
+    in.read((char*)&count, sizeof(count));
+    known_faces.clear();
+    for (size_t i = 0; i < count; ++i) {
+        size_t len;
+        in.read((char*)&len, sizeof(len));
+        std::string name(len, ' ');
+        in.read(&name[0], len);
+        std::vector<float> emb(512);
+        in.read((char*)emb.data(), 512 * sizeof(float));
+        known_faces[name] = emb;
+    }
+    in.close();
+}
+
+void FaceSystem::clearDatabase() {
+    known_faces.clear();
+    for (auto& t : tracker_db) {
+        t.name = "Unknown";
+    }
+    saveDatabase("faces.db");
 }

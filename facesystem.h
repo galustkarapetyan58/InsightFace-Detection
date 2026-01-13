@@ -1,10 +1,13 @@
 #pragma once
+
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
 #include <vector>
 #include <string>
 #include <map>
 #include <deque>
+#include <fstream>
+
 
 // Structure to hold one face's complete data
 struct FaceResult {
@@ -29,8 +32,12 @@ public:
     std::vector<FaceResult> detectAndEstimate(const cv::Mat& img);
 
     // Register a known face (save their fingerprint)
-    void registerFace(const std::string& name, const std::vector<float>& embedding);
+   void registerFace(const std::string& newName, const std::string& oldName, const std::vector<float>& embedding);
 
+    // --- NEW: SAVE & LOAD ---
+    void saveDatabase(const std::string& filename);
+    void loadDatabase(const std::string& filename);
+    void clearDatabase();
 private:
     Ort::Env env;
     Ort::Session* sessDet = nullptr; // Detection Model
@@ -41,7 +48,7 @@ private:
     void runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces);
     void runRecognition(const cv::Mat& img, std::vector<FaceResult>& faces);
     cv::Mat alignFace(const cv::Mat& img, const std::vector<cv::Point2f>& kps);
-
+    cv::Mat alignFaceZoomed(const cv::Mat& img, const std::vector<cv::Point2f>& kps);
     // Database of known people
     std::map<std::string, std::vector<float>> known_faces;
 };
