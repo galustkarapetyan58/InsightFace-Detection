@@ -1,23 +1,26 @@
-#pragma once
+// --- facesystem.h ---
+#ifndef FACESYSTEM_H
+#define FACESYSTEM_H
 
 #include <opencv2/opencv.hpp>
-#include <onnxruntime_cxx_api.h>
 #include <vector>
 #include <string>
 #include <map>
-#include <deque>
-#include <fstream>
+#include <onnxruntime_cxx_api.h>
 
-
-// Structure to hold one face's complete data
 struct FaceResult {
     cv::Rect box;
     float score;
-    std::vector<cv::Point2f> kps; // 5 Facial Landmarks
+    std::vector<cv::Point2f> kps;
+
+    // AI Results
     int age = 0;
-    int gender = 0;               // 0=Female, 1=Male
-    std::string name = "Unknown"; // Recognized Name
-    std::vector<float> embedding; // Face Fingerprint (512 numbers)
+    int gender = -1; // 0=Female, 1=Male
+    std::string name = "Unknown";
+    std::vector<float> embedding;
+
+    // NEW: Unique ID for perfect registration
+    int id = -1;
 };
 
 class FaceSystem {
@@ -25,30 +28,29 @@ public:
     FaceSystem();
     ~FaceSystem();
 
-    // Load all 3 AI models: Detection, Age/Gender, Recognition
     bool loadModels(const std::string& detPath, const std::string& agePath, const std::string& recPath);
-
-    // The main function: Takes an image, returns tracked and analyzed faces
     std::vector<FaceResult> detectAndEstimate(const cv::Mat& img);
 
-    // Register a known face (save their fingerprint)
-   void registerFace(const std::string& newName, const std::string& oldName, const std::vector<float>& embedding);
+    // NEW: We added 'faceID' to this function
+    void registerFace(const std::string& newName, const std::string& oldName, const std::vector<float>& embedding, int faceID);
 
-    // --- NEW: SAVE & LOAD ---
     void saveDatabase(const std::string& filename);
     void loadDatabase(const std::string& filename);
     void clearDatabase();
+
 private:
     Ort::Env env;
-    Ort::Session* sessDet = nullptr; // Detection Model
-    Ort::Session* sessAge = nullptr; // Age/Gender Model
-    Ort::Session* sessRec = nullptr; // Recognition Model
+    Ort::Session* sessDet = nullptr;
+    Ort::Session* sessAge = nullptr;
+    Ort::Session* sessRec = nullptr;
 
-    // Internal Helper Functions
-    void runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces);
-    void runRecognition(const cv::Mat& img, std::vector<FaceResult>& faces);
+    std::map<std::string, std::vector<float>> known_faces;
+
+    // Helper functions
     cv::Mat alignFace(const cv::Mat& img, const std::vector<cv::Point2f>& kps);
     cv::Mat alignFaceZoomed(const cv::Mat& img, const std::vector<cv::Point2f>& kps);
-    // Database of known people
-    std::map<std::string, std::vector<float>> known_faces;
+    void runRecognition(const cv::Mat& img, std::vector<FaceResult>& faces);
+    void runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces);
 };
+
+#endif // FACESYSTEM_H

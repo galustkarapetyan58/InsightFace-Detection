@@ -10,26 +10,27 @@
 
 // --- SETTINGS ---
 const float DETECT_THRESHOLD = 0.50f;
-
-// FIX 1: LOWER THRESHOLD (Was 0.40f)
-// 0.30f ensures that once you register a face, it stays registered.
-const float REC_THRESHOLD = 0.30f;
-
+const float REC_THRESHOLD = 0.25f; // Low threshold for webcam tolerance
 const float MATCH_DIST_THRESHOLD = 200.0f;
 const int MAX_MISSING_FRAMES = 10;
 const int ANALYSIS_INTERVAL = 5;
 
+// USE 640x640 FOR HIGH ACCURACY
 const int INPUT_W = 640;
 const int INPUT_H = 640;
 
 struct TrackedFace {
     int id;
     cv::Rect box;
+
+    // Smoothing Variables
     int stable_age = 0;
     int stable_gender = -1;
     float gender_momentum = 0.0f;
+
     std::string name;
     std::vector<float> embedding;
+
     int missing_frames = 0;
     int frames_since_analysis = 999;
 };
@@ -84,7 +85,7 @@ void nms(std::vector<FaceResult>& input, std::vector<FaceResult>& output, float 
     }
 }
 
-// --- FACE SYSTEM ---
+// --- FACE SYSTEM IMPLEMENTATION ---
 FaceSystem::FaceSystem() : env(ORT_LOGGING_LEVEL_ERROR, "FaceSystem") {}
 
 FaceSystem::~FaceSystem() {
@@ -140,6 +141,7 @@ void process_stride(int stride, const Ort::Value& tScore, const Ort::Value& tBox
     }
 }
 
+// 1. STANDARD ALIGNMENT (For Gender/Rec)
 cv::Mat FaceSystem::alignFace(const cv::Mat& img, const std::vector<cv::Point2f>& kps) {
     if (kps.size() < 5) return cv::Mat();
     std::vector<cv::Point2f> dstPts;
@@ -151,6 +153,7 @@ cv::Mat FaceSystem::alignFace(const cv::Mat& img, const std::vector<cv::Point2f>
     return aligned;
 }
 
+// 2. ZOOMED ALIGNMENT (For Age - Center on Nose)
 cv::Mat FaceSystem::alignFaceZoomed(const cv::Mat& img, const std::vector<cv::Point2f>& kps) {
     if (kps.size() < 5) return cv::Mat();
     std::vector<cv::Point2f> dstPts;
@@ -171,6 +174,7 @@ cv::Mat FaceSystem::alignFaceZoomed(const cv::Mat& img, const std::vector<cv::Po
     return aligned;
 }
 
+// --- MAIN LOOP ---
 std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
     if (img.empty()) return {};
     try {
@@ -186,6 +190,7 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
             outputNamePtrs.push_back(std::move(ptr));
         }
 
+        // 640x640 Input
         cv::Mat blob;
         cv::dnn::blobFromImage(img, blob, 1.0/128.0, cv::Size(INPUT_W, INPUT_H), cv::Scalar(127.5, 127.5, 127.5), true, false);
         std::vector<int64_t> inputShape = {1, 3, INPUT_H, INPUT_W};
@@ -196,6 +201,7 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
         std::vector<FaceResult> proposals;
         float rX = (float)img.cols / INPUT_W;
         float rY = (float)img.rows / INPUT_H;
+
         process_stride(8, outputs[0], outputs[3], outputs[6], 12800, rX, rY, proposals);
         process_stride(16, outputs[1], outputs[4], outputs[7], 3200, rX, rY, proposals);
         process_stride(32, outputs[2], outputs[5], outputs[8], 800, rX, rY, proposals);
@@ -211,7 +217,7 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
 
         for (const auto& detected : nms_faces) {
             std::vector<FaceResult> tempSingle = {detected};
-            runRecognition(img, tempSingle);
+            runRecognition(img, tempSingle); // Get ID embedding immediately
             FaceResult& fresh = tempSingle[0];
 
             int best_idx = -1;
@@ -226,12 +232,13 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
                 float ty = t.box.y + t.box.height / 2.0f;
                 float dist = std::sqrt(std::pow(cx - tx, 2) + std::pow(cy - ty, 2));
                 float similarity = calculateSimilarity(fresh.embedding, t.embedding);
-                bool looks_same = (t.embedding.empty() || similarity > 0.35f);
+                bool looks_same = (t.embedding.empty() || similarity > 0.30f); // 0.30 similarity required
 
                 if (dist < min_dist && looks_same) { min_dist = dist; best_idx = i; }
             }
 
             if (best_idx != -1) {
+                // EXISTING FACE
                 used_trackers.insert(best_idx);
                 TrackedFace& t = tracker_db[best_idx];
                 t.box = fresh.box;
@@ -259,10 +266,13 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
                 res.age = t.stable_age;
                 res.gender = t.stable_gender;
                 res.name = t.name.empty() ? "Unknown" : t.name;
+                res.id = t.id; // PASS ID TO RESULT
                 final_results.push_back(res);
             } else {
+                // NEW FACE
                 runAgeGender(img, tempSingle);
                 FaceResult& fresh = tempSingle[0];
+
                 TrackedFace t;
                 t.id = next_face_id++;
                 t.box = fresh.box;
@@ -273,7 +283,10 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
                 t.name = fresh.name;
                 t.embedding = fresh.embedding;
                 t.frames_since_analysis = 0;
+
                 tracker_db.push_back(t);
+
+                fresh.id = t.id; // PASS ID TO RESULT
                 final_results.push_back(fresh);
             }
         }
@@ -283,6 +296,8 @@ std::vector<FaceResult> FaceSystem::detectAndEstimate(const cv::Mat& img) {
         return final_results;
     } catch (...) { return {}; }
 }
+
+// --- AI RUNNERS ---
 
 void FaceSystem::runRecognition(const cv::Mat& img, std::vector<FaceResult>& faces) {
     if (!sessRec) return;
@@ -303,11 +318,16 @@ void FaceSystem::runRecognition(const cv::Mat& img, std::vector<FaceResult>& fac
             auto outputs = sessRec->Run(Ort::RunOptions{nullptr}, &inName, &inputOrt, 1, &outName, 1);
             float* outputData = outputs[0].GetTensorMutableData<float>();
             face.embedding.assign(outputData, outputData + 512);
+
             float max_sim = 0.0f;
             std::string best_name = "Unknown";
             for (auto const& [name, known_emb] : known_faces) {
                 float sim = calculateSimilarity(face.embedding, known_emb);
                 if (sim > max_sim) { max_sim = sim; best_name = name; }
+            }
+            if (max_sim > 0.15f && best_name != "Unknown") {
+                // Uncomment to debug similarity scores
+                // std::cout << "Match: " << best_name << " Score: " << max_sim << std::endl;
             }
             if (max_sim > REC_THRESHOLD) face.name = best_name;
         }
@@ -363,36 +383,40 @@ void FaceSystem::runAgeGender(const cv::Mat& img, std::vector<FaceResult>& faces
     } catch(...) {}
 }
 
-// --- FIX 2: AGGRESSIVE REGISTER FACE ---
-// Forces the tracker to take the name immediately
-void FaceSystem::registerFace(const std::string& newName, const std::string& oldName, const std::vector<float>& embedding) {
+// --- ID-BASED REGISTRATION (GHOST FIX) ---
+void FaceSystem::registerFace(const std::string& newName, const std::string& oldName, const std::vector<float>& embedding, int faceID) {
     if (embedding.size() != 512) return;
 
-    // 1. Update Database map
+    // 1. Update File Database
     if (oldName != "Unknown" && oldName.rfind("ID:", 0) != 0 && known_faces.count(oldName)) {
         known_faces.erase(oldName);
     }
     known_faces[newName] = embedding;
 
-    // 2. FORCE UPDATE TRACKER
-    // Instead of relying on exact name match, find the tracker that matches this embedding best
-    float bestSim = 0.0f;
-    TrackedFace* bestMatch = nullptr;
-
+    // 2. Lock Name to Tracker ID
+    bool found = false;
     for (auto& t : tracker_db) {
-        float sim = calculateSimilarity(t.embedding, embedding);
-        // Find the tracker most similar to the face we just registered
-        if (sim > bestSim) {
-            bestSim = sim;
-            bestMatch = &t;
+        if (t.id == faceID) {
+            t.name = newName;
+            t.embedding = embedding;
+            std::cout << "ID Locked Registration: Face #" << faceID << " is now " << newName << std::endl;
+            found = true;
+            break;
         }
     }
 
-    // If we found the tracker (we almost certainly will, since it's on screen), FORCE update it
-    if (bestMatch && bestSim > 0.30f) { // Use same low threshold
-        bestMatch->name = newName;
-        bestMatch->embedding = embedding;
-        std::cout << "Forced tracker update for: " << newName << " (Sim: " << bestSim << ")" << std::endl;
+    // Fallback: If ID not found, use similarity
+    if (!found) {
+        float bestSim = 0.0f;
+        TrackedFace* bestMatch = nullptr;
+        for (auto& t : tracker_db) {
+            float sim = calculateSimilarity(t.embedding, embedding);
+            if (sim > bestSim) { bestSim = sim; bestMatch = &t; }
+        }
+        if (bestMatch && bestSim > 0.25f) {
+            bestMatch->name = newName;
+            bestMatch->embedding = embedding;
+        }
     }
 }
 
