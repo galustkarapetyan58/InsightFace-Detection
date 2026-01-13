@@ -33,7 +33,7 @@ private:
     int fpsCounter = 0;
     float currentFPS = 0.0f;
     void keyPressEvent(QKeyEvent *event) override;
-    bool eventFilter(QObject *obj, QEvent *event) override;
+    //bool eventFilter(QObject *obj, QEvent *event) override;
     // --- THREADING VARIABLES ---
     bool isAIBusy = false;                // Is the AI currently thinking?
     QFutureWatcher<std::vector<FaceResult>> watcher; // Watches the background thread

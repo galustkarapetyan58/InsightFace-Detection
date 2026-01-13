@@ -123,6 +123,7 @@ void MainWindow::processFrame() {
     cap >> rawFrame;
     if (rawFrame.empty()) return;
 
+    // Display Frame (Small)
     cv::Mat displayFrame;
     cv::resize(rawFrame, displayFrame, cv::Size(640, 480));
 
@@ -147,29 +148,29 @@ void MainWindow::processFrame() {
         scaledBox.width = (int)(face.box.width * scaleX);
         scaledBox.height = (int)(face.box.height * scaleY);
 
-        // --- FIXED: ALWAYS GREEN ---
-        cv::Scalar color = cv::Scalar(0, 255, 0); // Green (B, G, R)
+        // 1. COLOR CODING (Blue=Male, Pink=Female)
+        cv::Scalar color;
+        if (face.gender == 1) color = cv::Scalar(255, 0, 0);       // Blue
+        else if (face.gender == 0) color = cv::Scalar(147, 20, 255); // Pink
+        else color = cv::Scalar(0, 255, 0);                        // Green (Unsure)
 
         cv::rectangle(displayFrame, scaledBox, color, 2);
 
-        // Create Label: "Name, Gender, Age"
+        // 2. TEXT LABEL (Fixed to include Gender again)
         std::string genderText = (face.gender == 1) ? "Male" : (face.gender == 0 ? "Female" : "?");
 
-        // Don't show "ID:X" or "Unknown" if we have a real name
-        std::string nameDisplay = face.name;
-
-        std::string label = nameDisplay + ", " + genderText + ", " + std::to_string(face.age);
+        std::string label = (face.name != "Unknown" ? face.name + ", " : "") +
+                            genderText + ", " +
+                            std::to_string(face.age);
 
         int baseLine;
         cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseLine);
         int textY = std::max(scaledBox.y - 10, labelSize.height + 5);
 
-        // Black background for text
         cv::rectangle(displayFrame, cv::Point(scaledBox.x, textY - labelSize.height - 5),
                       cv::Point(scaledBox.x + labelSize.width, textY + 5),
                       cv::Scalar(0, 0, 0), cv::FILLED);
 
-        // White text
         cv::putText(displayFrame, label, cv::Point(scaledBox.x, textY),
                     cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
     }
@@ -189,65 +190,8 @@ void MainWindow::processFrame() {
     videoLabel->setPixmap(QPixmap::fromImage(qimg));
     videoLabel->setScaledContents(true);
 }
+
 void MainWindow::onAIResultsReady() {
     currentFaces = watcher.result();
     isAIBusy = false;
-}
-
-bool MainWindow::eventFilter(QObject *obj, QEvent *event) {
-    if (event->type() == QEvent::KeyPress) {
-        QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
-
-        // --- REGISTER FACE ('R' Key) ---
-        if (keyEvent->key() == Qt::Key_R) {
-            if (currentFaces.empty()) {
-                QMessageBox::warning(this, "Error", "No face detected!");
-                return true;
-            }
-
-            bool wasBusy = isAIBusy;
-            isAIBusy = true; // Pause AI
-
-            // We iterate using a reference (&) so we can modify the face directly
-            for (auto& face : currentFaces) {
-
-                std::string currentName = face.name;
-                QString label = QString("Enter New Name for '%1':").arg(QString::fromStdString(currentName));
-
-                // Don't show "ID:0" or "Unknown" in the text box, keep it empty for easy typing
-                QString defaultText = (currentName.find("ID:") != std::string::npos || currentName == "Unknown")
-                                          ? "" : QString::fromStdString(currentName);
-
-                bool ok;
-                QString newName = QInputDialog::getText(this, "Register Face", label,
-                                                        QLineEdit::Normal, defaultText, &ok);
-
-                if (ok && !newName.isEmpty()) {
-                    // 1. Update Database
-                    faceSystem.registerFace(newName.toStdString(), currentName, face.embedding);
-                    faceSystem.saveDatabase("faces.db");
-
-                    // 2. FORCE UPDATE SCREEN IMMEDIATELY
-                    // This makes the name appear instantly next to the box
-                    face.name = newName.toStdString();
-                }
-            }
-
-            if (!wasBusy) isAIBusy = false; // Resume AI
-            return true;
-        }
-
-        // --- CLEAR DATABASE ('C' Key) ---
-        else if (keyEvent->key() == Qt::Key_C) {
-            QMessageBox::StandardButton reply;
-            reply = QMessageBox::question(this, "Clear Database",
-                                          "Delete ALL faces?",
-                                          QMessageBox::Yes|QMessageBox::No);
-            if (reply == QMessageBox::Yes) {
-                faceSystem.clearDatabase();
-            }
-            return true;
-        }
-    }
-    return QMainWindow::eventFilter(obj, event);
 }
